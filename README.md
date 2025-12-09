@@ -12,4 +12,4 @@ containerize full app
 log payloads that match no condition
 rules export and import
 
-ADD JWT auth
+ADD auth support for destination APIs

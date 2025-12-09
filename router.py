@@ -2,65 +2,14 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import httpx
 import os
-import sqlite3
 import json
 from typing import Dict, Any, Optional
 from enum import Enum
 from pathlib import Path
+from db import load_config_from_db, save_config_to_db, configs
+import uvicorn
 
 app = FastAPI(title="API Router with Configurable Filters")
-
-# Database initialization
-DB_PATH = Path("filter_configs.db")
-
-def init_db():
-    """Initialize SQLite database and create tables if they don't exist."""
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.cursor()
-    
-    # Create table for storing filter configurations
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS filter_configs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            config_name TEXT UNIQUE NOT NULL,
-            config_data TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def load_config_from_db(config_name: str = "default") -> Dict[str, Any]:
-    """Load filter configuration from database."""
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT config_data FROM filter_configs WHERE config_name = ?", (config_name,))
-    row = cursor.fetchone()
-    conn.close()
-    
-    if row:
-        return json.loads(row[0])
-    return None
-
-def save_config_to_db(config: Dict[str, Any], config_name: str = "default"):
-    """Save filter configuration to database."""
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.cursor()
-    
-    config_data = json.dumps(config)
-    
-    # Upsert: insert or update
-    cursor.execute("""
-        INSERT INTO filter_configs (config_name, config_data)
-        VALUES (?, ?)
-        ON CONFLICT(config_name) DO UPDATE SET config_data=?, updated_at=CURRENT_TIMESTAMP
-    """, (config_name, config_data, config_data))
-    
-    conn.commit()
-    conn.close()
-
 # Configurable target endpoints and filter conditions
 class TargetAPI(str, Enum):
     API_A = "http://api-a.example.com/endpoint"
@@ -74,8 +23,7 @@ DEFAULT_CONFIG = {
     }
 }
 
-# Initialize database and load config on startup
-init_db()
+ 
 FILTER_CONFIG = load_config_from_db("default") or DEFAULT_CONFIG
 save_config_to_db(FILTER_CONFIG, "default")
 
@@ -134,6 +82,12 @@ async def update_filter_config(config: Dict[str, Dict[str, str]]):
     save_config_to_db(FILTER_CONFIG, "default")
     return {"message": "Filter config updated", "config": FILTER_CONFIG}
 
+@app.get("/config/getfilters")
+async def get_filter_config():
+    """
+    Retrieve current filter configuration.
+    """
+    return {"config": FILTER_CONFIG}
 # Reload config endpoint
 @app.post("/config/reload")
 async def reload_filter_config():
@@ -151,5 +105,5 @@ async def reload_filter_config():
         return {"message": "No config found in database, using default", "config": FILTER_CONFIG}
 
 if __name__ == "__main__":
-    import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
