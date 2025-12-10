@@ -1,10 +1,11 @@
-from importlib.metadata import requires
 import sqlite3
 import json
-from typing import Dict, Any, Optional, List, Required
+from typing import Dict, Any, Optional, List
 from pathlib import Path
+from enum import Enum
 # Database initialization
 DB_PATH = Path("filter_configs.db")
+
 class Op(Enum):
     EQ = "eq"
     NEQ = "neq"
@@ -18,16 +19,17 @@ class Location(Enum):
     PATH = "path"
 
 
-class filter_config:
+class FilterConfigs:
+ 
     """
     Represents a filter configuration structure as used in the API.
     
     """
-    field: Required[str]
-    op: Required[Op]
-    value: Required[Any]
+    field: str
+    op: Op
+    value: Any
     location: Optional[Location]
-    api_endpoint: Required[str]
+    api_endpoint: str
 
     def __init__(self, field: str = None, op: Op = None, value: Any = None, location: Location = None, api_endpoint: str = None):
         self.field = field
@@ -38,7 +40,7 @@ class filter_config:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "field": self.field,
-            "op": self.op.value,
+            "op": self.op,
             "value": self.value,
             "location": self.location.value if self.location else None,
             "api_endpoint": self.api_endpoint
@@ -71,7 +73,8 @@ def init_db():
     conn.commit()
     conn.close()
 
-def load_config_from_db(config_name: str = "default") -> Dict[str, Any]:
+ 
+def load_config_from_db(config_name: str = "default") -> Optional[Dict[str, Any]]:
     """Load filter configuration from database."""
     conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
@@ -82,24 +85,64 @@ def load_config_from_db(config_name: str = "default") -> Dict[str, Any]:
         configs = {}
         for row in rows:
             configs[row[0]] = json.loads(row[1])
-    else:  
-  
+    else:
         cursor.execute("SELECT config_data FROM filter_configs WHERE config_name = ?", (config_name,))
         row = cursor.fetchone()
-        configs = json.loads(row[0])
+        if row:
+            configs = json.loads(row[0])
+        else:
+            configs = None
     conn.close()
     if configs:
         return configs
     return None
-
 def save_config_to_db(config: Dict[str, Any], config_name: str = "default"):
     """Save filter configuration to database."""
     conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
-    
-    config_data = json.dumps(config)
-    
-    # Upsert: insert or update
+
+    # Normalize config into a list-of-rule dicts before saving
+    def normalize_to_rules(cfg: Dict[str, Any]):
+        rules = []
+        if isinstance(cfg, list):
+            # assume list of rule dicts or FilterConfigs-like objects
+            for item in cfg:
+                if isinstance(item, dict):
+                    rules.append(item)
+                elif hasattr(item, "to_dict"):
+                    rules.append(item.to_dict())
+            return rules
+
+        if isinstance(cfg, dict):
+            # mapping style {field: {value: dest}}
+            for field, mapping in cfg.items():
+                if not isinstance(mapping, dict):
+                    continue
+                for match_value, dest in mapping.items():
+                    if isinstance(dest, str):
+                        rules.append({
+                            "field": field,
+                            "op": "eq",
+                            "value": match_value,
+                            "api_endpoint": dest,
+                            "location": None,
+                        })
+                    elif isinstance(dest, dict):
+                        rules.append({
+                            "field": field,
+                            "op": (dest.get("op") or "eq").lower(),
+                            "value": match_value,
+                            "api_endpoint": dest.get("api_endpoint") or dest.get("endpoint") or dest.get("target"),
+                            "location": (dest.get("location") or None),
+                        })
+            return rules
+
+        return []
+
+    normalized = normalize_to_rules(config)
+    config_data = json.dumps(normalized)
+
+    # Upsert: insert or update (store normalized list)
     cursor.execute("""
         INSERT INTO filter_configs (config_name, config_data)
         VALUES (?, ?)
