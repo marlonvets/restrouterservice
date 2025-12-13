@@ -1,5 +1,5 @@
 import unittest
-from router import _eval_rule, find_matching_filter, DEFAULT_CONFIG
+from main import _eval_rule, find_matching_filter, DEFAULT_CONFIG
 
 class TestRuleEvaluation(unittest.TestCase):
     def test_eq_match(self):

@@ -3,11 +3,20 @@ from pydantic import BaseModel
 import httpx
 import os
 import json
+import logging
 from typing import Dict, Any, Optional
 from enum import Enum
 from pathlib import Path
 from db import load_config_from_db, save_config_to_db, configs, FilterConfigs
 import uvicorn
+
+# Configure logging
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, log_level, logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="API Router with Configurable Filters")
 app.version = "1.0.0"
@@ -32,13 +41,14 @@ DEFAULT_CONFIG = [
             "op": "eq",
             "value": 2,
             "location": None,
-            "api_endpoint": "http://localhost:83/data"
+            "api_endpoint": "http://localhost:83/data2"
         },
 {"field": "branch",
             "op": "eq",
+
             "value": 'kingston',
             "location": None,
-            "api_endpoint": "http://localhost:83/data"
+            "api_endpoint": "http://localhost:83/data3"
         }
 ]
 
@@ -107,8 +117,9 @@ for r in NORMALIZED_RULES:
         r["api_endpoint"] = r["api_endpoint"].replace('\\', '/')
 
 save_config_to_db(NORMALIZED_RULES, "default")
+
+logger.info(f"Application started with {len(NORMALIZED_RULES)} routing rules")
 class ForwardPayload(BaseModel):
-    user_type: str
     data: Dict[str, Any]
     headers: Optional[Dict[str, str]] = None
 
@@ -152,6 +163,8 @@ def _eval_rule(rule: FilterConfigs, data: Dict[str, Any]) -> bool:
 
     actual = _get_field(data, field)
 
+    logger.debug(f"Evaluating rule: field='{field}', op='{op}', expected={expected}, actual={actual}")
+
     # Comparison semantics:
     # eq  -> actual == expected
     # neq -> actual != expected
@@ -159,20 +172,23 @@ def _eval_rule(rule: FilterConfigs, data: Dict[str, Any]) -> bool:
     # nin -> expected not in actual
     try:
         if op == "eq":
-            return actual == expected
-        if op == "neq":
-            return actual != expected
-        if op == "in":
+            result = actual == expected
+        elif op == "neq":
+            result = actual != expected
+        elif op == "in":
             # if actual is a string or iterable, check membership
-            return actual is not None and (expected in actual)
-        if op == "nin":
-            return actual is None or (expected not in actual)
-    except Exception:
-        # Any error during comparison -> treat as non-match
-        return False
+            result = actual is not None and (expected in actual)
+        elif op == "nin":
+            result = actual is None or (expected not in actual)
+        else:
+            logger.warning(f"Unknown operator '{op}' in rule evaluation")
+            result = False
 
-    # Unknown op -> no match
-    return False
+        logger.debug(f"Rule evaluation result: {result}")
+        return result
+    except Exception as e:
+        logger.warning(f"Error during rule evaluation: {e}")
+        return False
 
 
 def find_matching_filter(data: Dict[str, Any], filters: list[FilterConfigs] = None) -> Optional[Dict[str, Any]]:
@@ -191,43 +207,75 @@ def find_matching_filter(data: Dict[str, Any], filters: list[FilterConfigs] = No
 async def forward_request(payload: ForwardPayload):
     """
     Forward payload to target API based on configurable filter condition.
-    
+
     Filter logic: Routes based on user_type (premium -> API_A, standard -> API_B)
     """
-    # First try rule-based matching against payload.data
-    matched = find_matching_filter(payload.data, NORMALIZED_RULES)
-    target_url = None
-    if matched:
-        target_url = matched.api_endpoint
+    logger.info(f"Received forward request with payload: {payload}")
 
-    if not target_url:
-        print("No rule matched")
-        raise HTTPException(status_code=400, detail="No matching target API for filter condition")
-    
-    # Prepare headers (forward client headers + custom ones)
-    forward_headers = {
-        "Content-Type": "application/json",
-        **(payload.headers or {})
-    }
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            target_url,
-            json=payload.data,
-            headers=forward_headers
-        )
-    
-    # Return downstream response
-    return {
-        "status_code": response.status_code,
-        "data": response.json() if response.content else None,
-        "target_url": target_url
-    }
+    try:
+        # First try rule-based matching against payload.data
+        if payload.data is None:
+            logger.error("Payload data is missing")
+            raise HTTPException(status_code=400, detail="Payload data is required for routing")
+
+        logger.debug(f"Searching for matching rule in {len(NORMALIZED_RULES)} rules")
+        matched = find_matching_filter(payload.data, NORMALIZED_RULES)
+        target_url = None
+        if matched:
+            target_url = matched.get("api_endpoint") or matched.api_endpoint
+            logger.info(f"Matched rule: field={matched.get('field')}, op={matched.get('op')}, value={matched.get('value')} -> {target_url}")
+        else:
+            logger.warning(f"No rule matched for payload data: {payload.data}")
+
+        if not target_url:
+            logger.error("No matching target API for filter condition")
+            raise HTTPException(status_code=400, detail="No matching target API for filter condition")
+
+        # Prepare headers (forward client headers + custom ones)
+        forward_headers = {
+            "Content-Type": "application/json",
+            **(payload.headers or {})
+        }
+
+        logger.info(f"Forwarding request to: {target_url}")
+        logger.debug(f"Request headers: {forward_headers}")
+        logger.debug(f"Request payload: {payload.data}")
+
+        # async with httpx.AsyncClient(timeout=30.0) as client:
+        #     try:
+        #         response = await client.post(
+        #             target_url,
+        #             json=payload.data,
+        #             headers=forward_headers
+        #         )
+        #         logger.info(f"Received response from {target_url}: status={response.status_code}")
+        #         logger.debug(f"Response content: {response.text[:500]}...")  # Log first 500 chars
+
+        #         # Return downstream response
+        #         return {
+        #             "status_code": response.status_code,
+        #             "data": response.json() if response.content else None,
+        #             "target_url": target_url
+        #         }
+        #     except httpx.RequestError as e:
+        #         logger.error(f"HTTP request failed to {target_url}: {e}")
+        #         raise HTTPException(status_code=502, detail=f"Failed to reach target API: {str(e)}")
+        #     except Exception as e:
+        #         logger.error(f"Unexpected error during HTTP request to {target_url}: {e}")
+        #         raise HTTPException(status_code=502, detail=f"Error communicating with target API: {str(e)}")
+
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in forward_request: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 # Health check endpoint
 @app.get("/health")
 async def health_check():
     targets = [r.get("api_endpoint") for r in (NORMALIZED_RULES or []) if r.get("api_endpoint")]
+    logger.debug(f"Health check requested. Available targets: {targets}")
     return {"status": "healthy", "targets": targets}
 
 # Dynamic config endpoint (for runtime updates)
@@ -237,6 +285,7 @@ async def update_filter_config(config: Dict[str, Dict[str, str]]):
     Update filter configuration at runtime.
     Example: {"user_type": {"premium": "http://new-api.com", "standard": "http://old-api.com"}}
     """
+    logger.info(f"Updating filter config with: {config}")
     global FILTER_CONFIG, NORMALIZED_RULES
     # Merge updates into existing config (preserve other keys)
     if isinstance(FILTER_CONFIG, dict):
@@ -247,6 +296,7 @@ async def update_filter_config(config: Dict[str, Dict[str, str]]):
 
     save_config_to_db(FILTER_CONFIG, "default")
     NORMALIZED_RULES = _normalize_filters(FILTER_CONFIG)
+    logger.info(f"Filter config updated. New normalized rules count: {len(NORMALIZED_RULES)}")
     return {"message": "Filter config updated", "config": FILTER_CONFIG}
 
 @app.get("/config/getfilters")
@@ -254,7 +304,9 @@ async def get_filter_config():
     """
     Retrieve current filter configuration.
     """
+    logger.debug("Retrieving current filter configuration")
     return {"config": FILTER_CONFIG}
+
 # Reload config endpoint
 @app.post("/config/reload")
 async def reload_filter_config():
@@ -262,17 +314,21 @@ async def reload_filter_config():
     Reload filter configuration from database.
     Useful for refreshing configs after external DB updates.
     """
+    logger.info("Reloading filter configuration from database")
     global FILTER_CONFIG
     loaded_config = load_config_from_db("default")
-    
+
     if loaded_config:
         FILTER_CONFIG = loaded_config
         NORMALIZED_RULES = _normalize_filters(FILTER_CONFIG)
+        logger.info(f"Filter config reloaded. New normalized rules count: {len(NORMALIZED_RULES)}")
         return {"message": "Filter config reloaded from database", "config": FILTER_CONFIG}
     else:
+        logger.warning("No config found in database, using default")
         return {"message": "No config found in database, using default", "config": FILTER_CONFIG}
 
 if __name__ == "__main__":
 
     uvicorn.run(app, host="0.0.0.0", port=5000)
     
+

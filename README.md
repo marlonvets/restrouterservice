@@ -13,3 +13,6 @@ log payloads that match no condition
 rules export and import
 
 ADD auth support for destination APIs
+
+uvicorn main:app --host 0.0.0.0 --port 5000 --reload
+python -m uvicorn main:app --host 0.0.0.0 --port 5000 --reload
