@@ -26,6 +26,38 @@ class TestRuleEvaluation(unittest.TestCase):
         rule = {"field": "user.id", "op": "eq", "value": 42}
         self.assertTrue(_eval_rule(rule, {"user": {"id": 42}}))
 
+    def test_recursive_field_search(self):
+        # Test finding field anywhere in nested structure
+        rule = {"field": "id", "op": "eq", "value": 123}
+        data = {
+            "user": {
+                "profile": {
+                    "id": 123
+                }
+            },
+            "metadata": {
+                "other_id": 456
+            }
+        }
+        self.assertTrue(_eval_rule(rule, data))
+
+    def test_recursive_field_search_deep(self):
+        # Test finding field in deeply nested structure
+        rule = {"field": "target_value", "op": "eq", "value": "found"}
+        data = {
+            "level1": {
+                "level2": {
+                    "level3": {
+                        "items": [
+                            {"name": "item1"},
+                            {"target_value": "found"}
+                        ]
+                    }
+                }
+            }
+        }
+        self.assertTrue(_eval_rule(rule, data))
+
     def test_find_matching_filter(self):
         # Use DEFAULT_CONFIG which contains a rule for user==1
         matched = find_matching_filter({"user": 1}, DEFAULT_CONFIG)

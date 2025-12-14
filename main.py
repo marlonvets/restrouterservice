@@ -4,12 +4,14 @@ import httpx
 import os
 import json
 import logging
+from dotenv import load_dotenv
 from typing import Dict, Any, Optional
 from enum import Enum
 from pathlib import Path
 from db import load_config_from_db, save_config_to_db, configs, FilterConfigs
 import uvicorn
-
+load_dotenv(override=True)  # Load .env file if present, override existing env vars
+ 
 # Configure logging
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -24,7 +26,7 @@ app.description = """
 This service routes incoming API requests to different target APIs based on configurable filter conditions.
 # Configurable target endpoints and filter conditions
 """
- 
+
 class TargetAPI(str, Enum):
     API_A = "http://api-a.example.com/endpoint"
     API_B = "http://api-b.example.com/endpoint"
@@ -119,9 +121,6 @@ for r in NORMALIZED_RULES:
 save_config_to_db(NORMALIZED_RULES, "default")
 
 logger.info(f"Application started with {len(NORMALIZED_RULES)} routing rules")
-class ForwardPayload(BaseModel):
-    data: Dict[str, Any]
-    headers: Optional[Dict[str, str]] = None
 
 
 def _eval_rule(rule: FilterConfigs, data: Dict[str, Any]) -> bool:
@@ -150,16 +149,38 @@ def _eval_rule(rule: FilterConfigs, data: Dict[str, Any]) -> bool:
         expected = getattr(rule, "value", None)
 
     # Support simple dot-notation for nested fields (e.g. "user.id")
+    # Also support recursive search if field contains no dots
     def _get_field(d: Dict[str, Any], fld: str):
         if fld is None:
             return None
-        parts = fld.split(".")
-        cur = d
-        for p in parts:
-            if not isinstance(cur, dict) or p not in cur:
-                return None
-            cur = cur[p]
-        return cur
+        
+        # If field contains dots, use traditional dot notation traversal
+        if "." in fld:
+            parts = fld.split(".")
+            cur = d
+            for p in parts:
+                if not isinstance(cur, dict) or p not in cur:
+                    return None
+                cur = cur[p]
+            return cur
+        
+        # If no dots, recursively search for the field anywhere in the structure
+        def _find_recursive(obj, target_key):
+            if isinstance(obj, dict):
+                if target_key in obj:
+                    return obj[target_key]
+                for value in obj.values():
+                    result = _find_recursive(value, target_key)
+                    if result is not None:
+                        return result
+            elif isinstance(obj, list):
+                for item in obj:
+                    result = _find_recursive(item, target_key)
+                    if result is not None:
+                        return result
+            return None
+        
+        return _find_recursive(d, fld)
 
     actual = _get_field(data, field)
 
@@ -204,65 +225,89 @@ def find_matching_filter(data: Dict[str, Any], filters: list[FilterConfigs] = No
     return None
 
 @app.post("/forward")
-async def forward_request(payload: ForwardPayload):
+async def forward_request(payload: Request):
     """
     Forward payload to target API based on configurable filter condition.
 
     Filter logic: Routes based on user_type (premium -> API_A, standard -> API_B)
     """
-    logger.info(f"Received forward request with payload: {payload}")
+    logger.info(f"Received forward request with payload: {payload.json()}")
+    logger.debug(f"HTTP request headers: {dict(payload.headers)}")
 
     try:
         # First try rule-based matching against payload.data
-        if payload.data is None:
+        if payload.body is None:
             logger.error("Payload data is missing")
             raise HTTPException(status_code=400, detail="Payload data is required for routing")
-
+        
+        # Decode body from bytes to JSON
+        body_data = await payload.json()
+        print("Payload data:", body_data)
+        
         logger.debug(f"Searching for matching rule in {len(NORMALIZED_RULES)} rules")
-        matched = find_matching_filter(payload.data, NORMALIZED_RULES)
+        matched = find_matching_filter(body_data, NORMALIZED_RULES)
         target_url = None
         if matched:
-            target_url = matched.get("api_endpoint") or matched.api_endpoint
+            target_url = matched.get("api_endpoint")
             logger.info(f"Matched rule: field={matched.get('field')}, op={matched.get('op')}, value={matched.get('value')} -> {target_url}")
+         
         else:
-            logger.warning(f"No rule matched for payload data: {payload.data}")
+            logger.warning(f"No rule matched for payload data: {body_data}")
+        
 
         if not target_url:
             logger.error("No matching target API for filter condition")
-            raise HTTPException(status_code=400, detail="No matching target API for filter condition")
+            # raise HTTPException(status_code=400, detail="No matching target API for filter condition")
 
-        # Prepare headers (forward client headers + custom ones)
+        # Prepare headers (merge HTTP request headers + payload headers)
         forward_headers = {
             "Content-Type": "application/json",
-            **(payload.headers or {})
         }
 
+        # Add HTTP request headers (excluding hop-by-hop headers)
+        hop_by_hop_headers = {
+            'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+            'te', 'trailers', 'transfer-encoding', 'upgrade', 'host'
+        }
+
+        for header_name, header_value in payload.headers.items():
+            if header_name.lower() not in hop_by_hop_headers:
+                forward_headers[header_name] = header_value
+
+        # Override/add with payload headers if provided
         logger.info(f"Forwarding request to: {target_url}")
         logger.debug(f"Request headers: {forward_headers}")
-        logger.debug(f"Request payload: {payload.data}")
+        logger.debug(f"Request payload: {body_data}")
+        if log_level == "DEBUG":
+            logger.debug(f"Full payload body: {json.dumps(body_data, indent=2)}")
+            return {
+                "rule": matched,
+                "data":body_data,
+                "target_url": target_url
+            }
 
-        # async with httpx.AsyncClient(timeout=30.0) as client:
-        #     try:
-        #         response = await client.post(
-        #             target_url,
-        #             json=payload.data,
-        #             headers=forward_headers
-        #         )
-        #         logger.info(f"Received response from {target_url}: status={response.status_code}")
-        #         logger.debug(f"Response content: {response.text[:500]}...")  # Log first 500 chars
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                response = await client.post(
+                    target_url,
+                    json=payload.body,
+                    headers=forward_headers
+                )
+                logger.info(f"Received response from {target_url}: status={response.status_code}")
+                logger.debug(f"Response content: {response.text[:500]}...")  # Log first 500 chars
 
-        #         # Return downstream response
-        #         return {
-        #             "status_code": response.status_code,
-        #             "data": response.json() if response.content else None,
-        #             "target_url": target_url
-        #         }
-        #     except httpx.RequestError as e:
-        #         logger.error(f"HTTP request failed to {target_url}: {e}")
-        #         raise HTTPException(status_code=502, detail=f"Failed to reach target API: {str(e)}")
-        #     except Exception as e:
-        #         logger.error(f"Unexpected error during HTTP request to {target_url}: {e}")
-        #         raise HTTPException(status_code=502, detail=f"Error communicating with target API: {str(e)}")
+                # Return downstream response
+                return {
+                    "status_code": response.status_code,
+                    "data": response.json() if response.content else None,
+                    "target_url": target_url
+                }
+            except httpx.RequestError as e:
+                logger.error(f"HTTP request failed to {target_url}: {e}")
+                raise HTTPException(status_code=502, detail=f"Failed to reach target API: {str(e)}")
+            except Exception as e:
+                logger.error(f"Unexpected error during HTTP request to {target_url}: {e}")
+                raise HTTPException(status_code=502, detail=f"Error communicating with target API: {str(e)}")
 
     except HTTPException:
         # Re-raise HTTP exceptions as-is
